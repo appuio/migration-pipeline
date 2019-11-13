@@ -271,15 +271,6 @@ pipeline {
             archiveArtifacts artifacts: 'resources/**/*.*', fingerprint: true
             sh "rm -rf resources/"
         }
-        success {
-        	rocketSend avatar: 'https://chat.puzzle.ch/emoji-custom/success.png', channel: 'openshift-cloudscale', message: "Deployment success - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", rawMessage: true
-        }
-        unstable {
-            rocketSend avatar: 'https://chat.puzzle.ch/emoji-custom/unstable.png', channel: 'openshift-cloudscale', message: "Deployment unstable - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", rawMessage: true
-        }
-        failure {
-            rocketSend avatar: 'https://chat.puzzle.ch/emoji-custom/failure.png', channel: 'openshift-cloudscale', message: "Deployment failure - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", rawMessage: true
-        }
     }
 }
 
