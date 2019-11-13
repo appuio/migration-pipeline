@@ -1,0 +1,569 @@
+pipeline {
+    agent {
+        label "docker"
+    }
+    parameters {
+        string(name: 'SOURCE_NAMESPACE_PARAM', defaultValue: 'pitc-migration-source-test', description: 'Source Namespace where to copy all resources from')
+        string(name: 'DEST_NAMESPACE_PARAM', defaultValue: 'pitc-migration-dest-test', description: 'Destination Namespace where to copy all resources to, usually the same as on the source cluster')
+    }
+    options {
+        timeout(time: 1, unit: "HOURS")
+        buildDiscarder(logRotator(numToKeepStr: "500"))
+        disableConcurrentBuilds()
+        skipStagesAfterUnstable()
+    }
+    environment {
+        OCP_HOME = tool "oc"
+        PATH = "$OCP_HOME/bin:$PATH"
+		source_cluster = "OpenShiftSourceCluster"
+		source_cluster_credid = "openshift_source_jenkins_migration_prod_token_client_plugin"
+        source_cluster_registry = "registry.source.openshift.ch"
+		source_cluster_registry_cred = credentials("openshift-source-prod-jenkins-migration-username-password")
+        source_cluster_app_domain = "source.openshift.ch"
+		source_namespace = "${params.SOURCE_NAMESPACE_PARAM}"
+		dest_cluster = "OpenShiftDestinationCluster"
+		dest_cluster_credid = "openshift_destination_jenkins_migration_prod_token_client_plugin"
+        dest_cluster_registry = "registry.destination.openshift.ch"
+		dest_cluster_registry_cred = credentials("openshift-destination-prod-jenkins-migration-username-password")
+        dest_cluster_app_domain = "destination.openshift.ch"
+		dest_namespace = "${params.DEST_NAMESPACE_PARAM}"
+    }
+    stages {
+        stage ("migrate Project") {
+            steps {
+                script {
+                    openshift.withCluster("$source_cluster") {
+                        openshift.withCredentials("$source_cluster_credid") {
+                            openshift.withProject("$source_namespace") {
+                               echo "Hello from project ${openshift.project()} in cluster ${openshift.cluster()}"
+                               
+                               // read Source Namespace
+                               def namespace_source_maps = openshift.selector( 'namespace', "$source_namespace")
+                               if(!namespace_source_maps.exists()){
+                                   error "source Namespace ($source_namespace) does not exist!!!"
+                               }
+                               def source_obj = namespace_source_maps.object()
+                               
+                               openshift.withCluster("$dest_cluster") {
+                                 openshift.withCredentials("$dest_cluster_credid") {
+                                   openshift.withProject("$dest_namespace") {
+                                        echo "Hello from project ${openshift.project()} in cluster ${openshift.cluster()}"
+                                        // read dest Namespace
+                                        def namespace_dest_maps = openshift.selector( 'namespace', "$dest_namespace")
+                                        if(!namespace_dest_maps.exists()){
+                                            // create Project
+                                            echo "create destination project"
+                                            openshift.newProject("$dest_namespace")
+                                            sleep 5
+                                        }
+                                        // synch Labels
+                                        namespace_dest_maps = openshift.selector( 'namespace', "$dest_namespace")
+                                        def dest_obj = namespace_dest_maps.object()
+                                        echo "${dest_obj}"
+
+                                        if(dest_obj.metadata.labels == null){
+                                           dest_obj.metadata.labels = [:]
+                                        }
+
+                                        source_obj.metadata.labels.each { key, value ->
+                                            if(key != "pitc-migration-status"){
+                                                dest_obj.metadata.labels[ key ] = value
+                                            }
+                                        }
+                                        // save
+                                        writeFile file: "resources/patch-resource-namespace.yaml", text: "${dest_obj}"
+                                        openshift.apply(dest_obj)
+                                   }
+                                 }
+                              }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage ("Create ImageStreams And Promote images") {
+            steps {
+                script {
+                    openshift.withCluster("$source_cluster") {
+                        openshift.withCredentials("$source_cluster_credid") {
+                            openshift.withProject("$source_namespace") {
+                               echo "Hello from project ${openshift.project()} in cluster ${openshift.cluster()}"
+                               
+                               // read all resources
+                               def is_maps = openshift.selector( 'is')
+                               
+                               // Model the source objects using the 'exportable' flag to strip cluster
+                               // specific information from the objects (i.e. like 'oc export').
+                               def is_objs = exportISObjects(is_maps)
+                               
+                               openshift.withCluster("$dest_cluster") {
+                                 openshift.withCredentials("$dest_cluster_credid") {
+                                   openshift.withProject("$dest_namespace") {
+                                      echo "Hello from project ${openshift.project()} in cluster ${openshift.cluster()}"
+
+                                      // create the objects again in the new Namespace
+                                      convertImagestreams(is_objs, source_namespace, dest_namespace)
+                                      createObjects(is_objs)
+
+                                      // push images
+
+                                        // login into registrys
+                                        sh 'docker login -u $source_cluster_registry_cred_USR -p $source_cluster_registry_cred_PSW $source_cluster_registry'
+                                        sh 'docker login -u $dest_cluster_registry_cred_USR -p $dest_cluster_registry_cred_PSW $dest_cluster_registry'
+
+                                        if(is_objs != null){
+                                            for ( obj in is_objs ) {
+                                                if(obj.spec.tags == null){
+                                                    echo "Mirror latest image $obj.kind: $obj.metadata.name in ${openshift.project()}"
+                                                        script{
+                                                            try{
+                                                                sh """
+                                                                    oc image mirror $source_cluster_registry/$source_namespace/$obj.metadata.name:latest $dest_cluster_registry/$dest_namespace/$obj.metadata.name:latest
+                                                                """
+                                                            }catch (Exception e) {
+                                                                echo "Unable to mirror the image: $obj.metadata.name:latest"
+                                                                echo "${e}" 
+                                                            }
+                                                        }
+                                                }else{
+                                                    for(tag in obj.spec.tags){
+                                                        if(!hasImportedAnnotation(tag)){
+                                                            echo "Mirror image $obj.kind: $obj.metadata.name in ${openshift.project()}"
+                                                            script{
+                                                                try{
+                                                                    sh """
+                                                                        oc image mirror $source_cluster_registry/$source_namespace/$obj.metadata.name:$tag.name $dest_cluster_registry/$dest_namespace/$obj.metadata.name:$tag.name
+                                                                    """
+                                                                }catch (Exception e) {
+                                                                    echo "Unable to mirror the image: $obj.metadata.name:$tag.name"
+                                                                    echo "${e}" 
+                                                                }
+                                                            }
+                                                        
+                                                        }else{
+                                                            echo "not migrating the image, because it hase the importedTag: $obj.metadata.name:$tag.name"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // logout
+                                        sh 'docker logout $source_cluster_registry'
+                                        sh 'docker logout $dest_cluster_registry'
+
+                                   }
+                                 }
+                              }
+                            }
+                        }
+                    }
+					
+                }
+            }
+        }
+        stage ("migrate Resources") {
+            steps {
+                script {
+                    openshift.withCluster("$source_cluster") {
+                        openshift.withCredentials("$source_cluster_credid") {
+                            openshift.withProject("$source_namespace") {
+                               echo "Hello from project ${openshift.project()} in cluster ${openshift.cluster()}"
+                               
+                               // read all resources
+                               def dc_maps = openshift.selector( 'dc')
+                               def deployment_maps = openshift.selector( 'deployment')
+                               def statefulset_maps = openshift.selector( 'statefulset')
+                               def bc_maps = openshift.selector( 'bc')
+                               def svc_maps = openshift.selector( 'svc')
+                               def routes_maps = openshift.selector( 'routes')
+                               def configmap_maps = openshift.selector( 'configmap')
+                               def secret_maps = openshift.selector( 'secret')
+                               def sa_maps = openshift.selector( 'serviceaccount')
+                               def role_maps = openshift.selector( 'role')
+                               def roleginding_maps = openshift.selector( 'rolebinding')
+                               def pvc_maps = openshift.selector( 'pvc')
+                               def cronjob_maps = openshift.selector( 'cronjob')
+                               def prometheusrules_maps = openshift.selector('PrometheusRule')
+                               def limits_maps = openshift.selector('limitrange')
+                               def quota_maps = openshift.selector('quota')
+                               def templates_maps = openshift.selector('template')
+
+                               
+                               // Model the source objects using the 'exportable' flag to strip cluster
+                               // specific information from the objects (i.e. like 'oc export').
+                               def dc_objs = exportObjects(dc_maps)
+                               def deployment_objs = exportObjects(deployment_maps)
+                               def statefulset_objs = exportObjects(statefulset_maps)
+                               def bc_objs = exportObjects(bc_maps)
+                               def svc_objs = exportObjects(svc_maps)
+                               def routes_objs = exportObjects(routes_maps)
+                               def configmaps_objs = exportObjects(configmap_maps)
+                               def secret_objs = exportObjects(secret_maps)
+                               def sa_objs = exportObjects(sa_maps)
+                               def role_objs = exportObjects(role_maps)
+                               def rolebinding_objs = exportObjects(roleginding_maps)
+                               def pvc_objs = exportObjects(pvc_maps)
+                               def cronjob_objs = exportObjects(cronjob_maps)
+                               def prometheusrules_objs = exportObjects(prometheusrules_maps)
+                               def limits_objs = exportObjects(limits_maps)
+                               def quota_objs = exportObjects(quota_maps)
+                               def templates_objs = exportObjects(templates_maps)
+                               
+                               // convert routes
+                               convertRoutes(routes_objs, source_namespace, dest_namespace, source_cluster_app_domain, dest_cluster_app_domain)
+                               
+                               // modify trigger in dc to use the correct is and also update container image
+                               convertDeploymentConfigs(dc_objs, source_namespace, dest_namespace)
+
+                               // modify container image in deployment to use the correct is
+                               convertDeployments(deployment_objs, source_namespace, dest_namespace)
+
+                               // modify container image in deployment to use the correct is
+                               convertStatefulset(statefulset_objs, source_namespace, dest_namespace)
+
+                               //convert PVCs
+                               convertPVCs(pvc_objs, pvc_maps, source_namespace, dest_namespace)
+                               
+                               openshift.withCluster("$dest_cluster") {
+                                 openshift.withCredentials("$dest_cluster_credid") {
+                                   openshift.withProject("$dest_namespace") {
+                                      echo "Hello from project ${openshift.project()} in cluster ${openshift.cluster()}"
+                               
+                                      // Note that the selector is relative to its closure body and
+                                      // operates on the qecluster now.
+
+                                      // create the objects again in the new Namespace
+                                      createNonexistentSecretObjects(secret_objs, openshift.selector( 'secret'))
+                                      createNonexistentServiceAccountObjects(sa_objs, openshift.selector( 'serviceaccount'))
+
+                                      // Roles befor Rolebinding to ensure they exists for the Binding
+                                      createObjects( role_objs )
+
+                                      patchRolebindingObjects(rolebinding_objs)
+
+                                      createObjects( configmaps_objs )
+                                      createObjects( pvc_objs )
+                                      createObjects( dc_objs )
+                                      createObjects( deployment_objs )
+                                      createObjects( statefulset_objs )
+                                      createObjects( bc_objs )
+                                      createServiceObjects( svc_objs )
+                                      createObjects( routes_objs )
+                                      createObjects( cronjob_objs )
+                                      createObjects( prometheusrules_objs )
+                                      patchLimits(limits_objs)
+                                      createObjects( quota_objs )
+                                      createObjects( templates_objs )
+                                   }
+                                 }
+                              }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'resources/**/*.*', fingerprint: true
+            sh "rm -rf resources/"
+        }
+        success {
+        	rocketSend avatar: 'https://chat.puzzle.ch/emoji-custom/success.png', channel: 'openshift-cloudscale', message: "Deployment success - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", rawMessage: true
+        }
+        unstable {
+            rocketSend avatar: 'https://chat.puzzle.ch/emoji-custom/unstable.png', channel: 'openshift-cloudscale', message: "Deployment unstable - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", rawMessage: true
+        }
+        failure {
+            rocketSend avatar: 'https://chat.puzzle.ch/emoji-custom/failure.png', channel: 'openshift-cloudscale', message: "Deployment failure - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", rawMessage: true
+        }
+    }
+}
+
+def exportObjects(objs){
+    echo "Exporting Objects project ${openshift.project()} in cluster ${openshift.cluster()}"
+    if(objs.exists()){
+        objs.withEach { 
+            echo "Export: ${it.name()} is defined in ${openshift.project()}"
+        }
+        return objs.objects( exportable:true )
+    }   
+}
+
+def exportISObjects(objs){
+    echo "Exporting Imagestreams project ${openshift.project()} in cluster ${openshift.cluster()}"
+    if(objs.exists()){
+        objs.withEach { 
+            echo "Export: ${it.name()} is defined in ${openshift.project()}"
+        }
+        return objs.objects()
+    }
+}
+
+def deleteObjects(objs){
+    echo "Deleteing Objects in project ${openshift.project()} in cluster ${openshift.cluster()}"
+    if(objs != null && objs.exists()){
+
+        for ( obj in objs.objects( exportable:true ) ) {
+            echo "delete $obj.kind: $obj.metadata.name in ${openshift.project()}"
+        }
+        objs.delete( '--ignore-not-found' )
+    }   
+}
+def createObjects(objs){
+    echo "Creating Objects in project ${openshift.project()} in cluster ${openshift.cluster()}"
+    if(objs != null){
+        for ( obj in objs ) {
+            echo "create $obj.kind: $obj.metadata.name in ${openshift.project()}"
+            writeFile file: "resources/resource-$obj.kind-$obj.metadata.name" + ".yaml", text: "${obj}"
+        }
+        
+        openshift.create(objs)
+    }   
+}
+
+def patchRolebindingObjects(objs){
+    echo "Creating Rolebindings in project ${openshift.project()} in cluster ${openshift.cluster()}"
+
+    def whiteList = ["admin", "edit", "view"]
+    def ingoreList = ["edit-jenkinscicd"]
+    if(objs != null){
+        for ( obj in objs ) {
+            if(onWhiteList(obj.metadata.name, whiteList) && !onIgnoreList(obj.metadata.name, ingoreList)){
+                echo "create $obj.kind: $obj.metadata.name in ${openshift.project()}"
+                writeFile file: "resources/patch-resource-$obj.kind-$obj.metadata.name" + ".yml", text: "${obj}"
+                openshift.apply(obj)
+            }
+        }
+    }   
+}
+
+def patchLimits(objs){
+    echo "Patching Limits in project ${openshift.project()} in cluster ${openshift.cluster()}"
+    if(objs != null){
+        for ( obj in objs ) {
+            echo "patch $obj.kind: $obj.metadata.name in ${openshift.project()}"
+            writeFile file: "resources/patch-resource-$obj.kind-$obj.metadata.name" + ".yml", text: "${obj}"
+            openshift.apply(obj)
+        }
+    }  
+}
+
+def createNonexistentSecretObjects(objs, existingObjects){
+    echo "Creating Secrets in project ${openshift.project()} in cluster ${openshift.cluster()}"
+
+    def ingoreList = ["builder-dockercfg-", "default-dockercfg-", "deployer-dockercfg-", "builder-token-", "default-token-", "deployer-token-"]
+
+    if(objs != null){
+        def new_objs = []
+        for ( obj in objs ) {
+            if(!alreadyExists(obj, existingObjects) && !onIgnoreList(obj.metadata.name, ingoreList)){
+                new_objs << obj
+                echo "create $obj.kind: $obj.metadata.name in ${openshift.project()}"
+            }
+        }
+        if(!new_objs.isEmpty()){
+            createObjects(new_objs)
+        }
+        
+    }   
+}
+
+def createNonexistentServiceAccountObjects(objs, existingObjects){
+    echo "Creating SAs in project ${openshift.project()} in cluster ${openshift.cluster()}"
+
+    def ingoreList = ["builder", "default", "deployer"]
+
+    if(objs != null){
+        def new_objs = []
+        for ( obj in objs ) {
+            if(!alreadyExists(obj, existingObjects) && !onIgnoreList(obj.metadata.name, ingoreList)){
+                new_objs << obj
+                echo "create $obj.kind: $obj.metadata.name in ${openshift.project()}"
+            }
+        }
+        if(!new_objs.isEmpty()){
+            createObjects(new_objs)
+        }
+    }   
+}
+
+def createServiceObjects(objs){
+    echo "Creating Services in project ${openshift.project()} in cluster ${openshift.cluster()}"
+    // don't migrate gluster services
+    def ingoreList = ["glusterfs-cluster", "glusterfs-dynamic-"]
+
+    if(objs != null){
+        def new_objs = []
+        for ( obj in objs ) {
+            if(!onIgnoreList(obj.metadata.name, ingoreList)){
+                new_objs << obj
+                echo "create $obj.kind: $obj.metadata.name in ${openshift.project()}"
+            }
+        }
+        if(!new_objs.isEmpty()){
+            createObjects(new_objs)
+        }
+    }   
+}
+
+def onIgnoreList(name, ignoreList){
+    if(name != null){
+        for ( ignore in ignoreList ) {
+            if(name.startsWith(ignore)){
+                return true
+            }
+        }
+    }
+    return false
+}
+
+def onWhiteList(name, whiteList){
+    if(name != null){
+        for ( white in whiteList ) {
+            if(name.startsWith(white)){
+                return true
+            }
+        }
+    }
+    return false
+}
+
+def alreadyExists(obj, existingObjects){
+    if(existingObjects != null){
+        def exiostingObjects_objs = existingObjects.objects( exportable:true )
+        for ( objexisting in exiostingObjects_objs ) {
+            if(obj.metadata.name != null && objexisting.metadata.name != null && obj.metadata.name == objexisting.metadata.name && obj.kind == objexisting.kind){
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+
+def convertRoutes(routes, source_namespace, destination_namespace, source_appdomain, destination_appdomain){
+    if(routes != null){
+        echo "Converting Routes"
+        for ( obj in routes ) {
+            echo "Route: $obj.metadata.name "
+            // replace namespace in default routes
+            obj.spec.host = obj.spec.host.replace(source_namespace, destination_namespace)
+            // replace default app subdomain
+            obj.spec.host = obj.spec.host.replace(source_appdomain, destination_appdomain)
+        }
+    }
+}
+
+def convertImagestreams(iss,  source_namespace, destination_namespace){
+    if(iss != null){
+        echo "Converting Imagestreams:"
+        for ( obj in iss ) {
+            echo "Imagestream: $obj.metadata.name" 
+            // remove all cluster specific elements
+            obj.metadata.remove('namespace')
+            obj.metadata.remove('resourceVersion')
+            obj.metadata.remove('selfLink')
+            obj.metadata.creationTimestamp = null
+            obj.remove('status')
+        }
+    }
+}
+
+def convertDeploymentConfigs(dcs,  source_namespace, destination_namespace){
+    if(dcs != null){
+        echo "Converting DeploymentConfigs:"
+        for ( obj in dcs ) {
+            echo "Deployment Config: $obj.metadata.name" 
+            // change namespace if source and dest namespace are not the same
+            for ( trigger in obj.spec.triggers ) {
+                if(trigger.type == "ImageChange"){
+                    trigger.imageChangeParams.from.namespace = trigger.imageChangeParams.from.namespace.replace(source_namespace, destination_namespace)
+                }
+            }
+            for ( container in obj.spec.template.spec.containers ) {
+                container.image = container.image.replace(source_namespace, destination_namespace)
+            }
+        }
+    }
+}
+
+def convertDeployments(ds,  source_namespace, destination_namespace){
+    if(ds != null){
+        echo "Converting Deployment:"
+        for ( obj in ds ) {
+            echo "Deployment: $obj.metadata.name" 
+            // change namespace if source and dest namespace are not the same
+            for ( container in obj.spec.template.spec.containers ) {
+                container.image = container.image.replace(source_namespace, destination_namespace)
+            }
+        }
+    }
+}
+
+def convertStatefulset(statefulsets,  source_namespace, destination_namespace){
+    if(statefulsets != null){
+        echo "Converting Statefulsets:"
+        for ( obj in statefulsets ) {
+            echo "Statefulset: $obj.metadata.name" 
+            // change namespace if source and dest namespace are not the same
+            for ( container in obj.spec.template.spec.containers ) {
+                container.image = container.image.replace(source_namespace, destination_namespace)
+            }
+        }
+    }
+}
+
+def convertPVCs(pvcs, pvcs_org, source_namespace, destination_namespace){
+
+    if(pvcs != null){
+        echo "Converting PVCs:"
+        for ( obj in pvcs ) {
+            echo "PVC: $obj.metadata.name"
+            // remove the volumeName
+            obj.spec.remove('volumeName')
+            obj.metadata.annotations.remove('pv.kubernetes.io/bind-completed')
+            obj.metadata.annotations.remove('pv.kubernetes.io/bound-by-controller')
+            obj.metadata.annotations.remove('volume.beta.kubernetes.io/storage-provisioner')
+
+            // migrate Storage Class
+            obj.metadata.labels.each { key, value ->
+                echo "Key: $key, value: $value"
+                if("$key" == "pitc-storage-class"){
+                    echo "switches storage class to $value"
+                    obj.spec.storageClassName = value
+                }
+            }
+
+            //capacity instead of pvc request
+            if(pvcs_org.exists()){
+                pvcs_org.withEach {
+                    // get object not in exported format, so it consist of the status element
+                    def pvcobj = it.object()
+                    // same pvc and request != current capacity
+                    def request = pvcobj.spec.resources.requests.storage
+                    def capacity = pvcobj.status.capacity.storage
+                    if(obj.metadata.name == pvcobj.metadata.name && request != capacity){
+                        echo "Updates storage request ($request, new: $capacity)."
+                        // set value on the exported obj
+                        obj.spec.resources.requests.storage = capacity
+                    }
+                }
+            }
+        }
+    }
+}
+
+def hasImportedAnnotation(tag){
+    if(tag != null && tag.annotations != null){
+        for ( annotation in tag.annotations ) {
+            if(annotation.key == "openshift.io/imported-from"){
+                return true
+            }
+        }
+    }
+    return false
+}
