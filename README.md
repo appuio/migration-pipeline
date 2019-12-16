@@ -177,3 +177,8 @@ umount /root/data_migration/old
 ## Known issues
 
 * verify Image Streams after the migration script ran
+
+# License
+
+The Migration Pipeline is licensed under the Apache License 2.0, see [LICENSE file](LICENSE)
+
