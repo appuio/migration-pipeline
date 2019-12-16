@@ -140,7 +140,7 @@ vol_7dfff8644d7e1f38c5df02ac54232fb1
 ```
 5. With the vol_id you can mount the gluster-device on the bastion-host
 ```
-ssh your-user@bastion01.cloud.puzzle.ch
+ssh your-user@yourserver
 # gluster-endpoints
 10.2.111.63
 
